@@ -21,6 +21,7 @@ class ArgumentParser:
         parser.add_argument("--model_name", type=str, default=self.cfg.model_name)
         parser.add_argument("--model_dir", type=str)
         parser.add_argument("--model_path", type=str, default=self.cfg.model_path)
+        parser.add_argument("--slice_output_dir", type=str, default=None, required=False)
         parser.add_argument(
             "--device", type=str, default=self.cfg.model_device, help="Warning: Abandoning this parameter"
         )
@@ -164,4 +165,5 @@ class ArgumentParser:
         self.cfg.sched_port = free_ports[0]
         self.cfg.sched_metrics_port = free_ports[1]
         self.cfg.kvc2_metrics_port = free_ports[2]
+        print(f"DEBUG: slice_output_dir = {args.slice_output_dir}")  
         return args

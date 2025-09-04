@@ -109,7 +109,7 @@ class Config(metaclass=Singleton):
         self.optimize_config_path: Optional[str] = self.model.get(
             "optimize_config_path", None
         )
-        
+        self.slice_output_dir: Optional[str] = None 
         self.max_new_tokens = self.model.get("max_new_tokens", 2000)
         self.json_mode = self.model.get("json_mode", False)
         self.healing = self.model.get("healing", False)

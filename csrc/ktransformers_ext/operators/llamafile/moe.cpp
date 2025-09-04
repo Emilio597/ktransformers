@@ -11,7 +11,9 @@
 #include <iostream>
 #include <cstdint>
 #include <math.h>
-
+#include <climits>
+#include <filesystem>
+#include <fstream>
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
@@ -142,7 +144,10 @@ static float act_fn_relu(float x) {
         return 0.0;
     }
 }
-
+#ifdef TIME_PERF
+#include <mutex>
+std::mutex timing_mutex;
+#endif
 void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend) {
     const void* gate_input_ptr;
     const void* up_input_ptr;
@@ -169,7 +174,21 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
         }
     }
     int nth = config_.intermediate_size / config_.stride;
+#ifdef TIME_PERF
+    // 添加时间统计变量  
+    long long gate_total = 0;
+    long long gate_min = LLONG_MAX;
+    long long gate_max = LLONG_MIN;
+      
+    // Down projection统计变量
+    long long down_total = 0;
+    long long down_min = LLONG_MAX;
+    long long down_max = LLONG_MIN;
+#endif
     backend->do_work_stealing_job(nth * k, nullptr, [&](int task_id) {
+#ifdef TIME_PERF
+        auto start_time = std::chrono::high_resolution_clock::now();  
+#endif
         int expert_idx = task_id / nth;
         uint64_t expert_id = expert_ids[expert_idx];
         int ith = task_id % nth;
@@ -207,7 +226,29 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             void* down_input_ptr = s_down_input_[expert_idx] + ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
             from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
         }
+#ifdef TIME_PERF
+        auto end_time = std::chrono::high_resolution_clock::now();  
+        auto t = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+         // 多线程安全更新
+        {
+            std::lock_guard<std::mutex> lock(timing_mutex);
+            gate_total += t;
+            if (t < gate_min) gate_min = t;
+            if (t > gate_max) gate_max = t;
+        }
+#endif
     }, nullptr);
+
+    int gate_count = nth * k;
+#ifdef TIME_PERF
+    double gate_avg = gate_count > 0 ? static_cast<double>(gate_total) / gate_count : 0.0;
+    std::cout << "=== Forward One Timing Statistics ===" << std::endl;
+    std::cout << "Gate+Up projection jobs:" << std::endl;
+    std::cout << " Count: " << gate_count << std::endl;
+    std::cout << " Avg: " << gate_avg << " μs" << std::endl;
+    std::cout << " Min: " << gate_min << " μs" << std::endl;
+    std::cout << " Max: " << gate_max << " μs" << std::endl;
+#endif
     if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) != 0) {
         for (int i = 0; i < k; i++) {
             from_float(s_intermediate_fp32_[i], s_down_input_[i], config_.intermediate_size, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
@@ -215,6 +256,9 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     }
     nth = config_.hidden_size / config_.stride;
     backend->do_work_stealing_job(nth, nullptr, [&](int task_id) {
+#ifdef TIME_PERF
+        auto start_time = std::chrono::high_resolution_clock::now(); 
+#endif
         int ith = task_id;
         for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
             s_output_fp32_[i] = 0;
@@ -239,10 +283,29 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             void* output_ptr = (uint8_t*)output + ith * config_.stride * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type);
             from_float(output_fp32_ptr, output_ptr, config_.stride, config_.hidden_type);
         }
+#ifdef TIME_PERF
+        auto end_time = std::chrono::high_resolution_clock::now(); 
+        auto t = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        {
+            std::lock_guard<std::mutex> lock(timing_mutex);
+            down_total += t;
+            if (t < down_min) down_min = t;
+            if (t > down_max) down_max = t;
+        }
+#endif
     }, nullptr);
     if (config_.stride % ggml_blck_size(config_.hidden_type) != 0) {
         from_float(s_output_fp32_, output, config_.hidden_size, config_.hidden_type);
     }
+    int down_count = nth;
+#ifdef TIME_PERF
+    double down_avg = down_count > 0 ? static_cast<double>(down_total) / down_count : 0.0;
+    std::cout << "Down projection jobs:" << std::endl;
+    std::cout << " Count: " << down_count << std::endl;
+    std::cout << " Avg: " << down_avg << " μs" << std::endl;
+    std::cout << " Min: " << down_min << " μs" << std::endl;
+    std::cout << " Max: " << down_max << " μs" << std::endl;
+#endif
 }
 
 void MOE::forward_many(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend) {
@@ -377,4 +440,85 @@ void MOE::forward(int qlen, int k, const uint64_t* expert_ids, const float* weig
 
     batch_size_tensor[0] -= forward_len;
     forward(qlen - forward_len, k, expert_ids + forward_len * k, weights + forward_len * k, (uint8_t*)input + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), (uint8_t*)output + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), batch_size_tensor, backend);
+}
+
+void MOE::save_weight_slices(const std::string& output_dir) {  
+    // 创建输出目录  
+    std::filesystem::create_directories(output_dir);  
+        
+    int nth_gate_up = config_.intermediate_size / config_.stride;  
+    int nth_down = config_.hidden_size / config_.stride;  
+        
+    // 保存gate_proj和up_proj切片  
+    for (int expert_id = 0; expert_id < config_.expert_num; expert_id++) {  
+        for (int ith = 0; ith < nth_gate_up; ith++) {  
+            // Gate projection切片  
+            size_t gate_offset = (expert_id * config_.intermediate_size + ith * config_.stride) *   
+                                config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
+            size_t gate_slice_size = config_.stride * config_.hidden_size *   
+                                    ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
+                
+            std::string gate_filename = output_dir + "/gate_expert_" + std::to_string(expert_id) +   
+                                        "_slice_" + std::to_string(ith) + ".bin";  
+            save_slice_to_file((uint8_t*)gate_proj_ + gate_offset, gate_slice_size, gate_filename);  
+                
+            // Up projection切片  
+            size_t up_offset = (expert_id * config_.intermediate_size + ith * config_.stride) *   
+                                config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
+            size_t up_slice_size = config_.stride * config_.hidden_size *   
+                                    ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
+                
+            std::string up_filename = output_dir + "/up_expert_" + std::to_string(expert_id) +   
+                                    "_slice_" + std::to_string(ith) + ".bin";  
+            save_slice_to_file((uint8_t*)up_proj_ + up_offset, up_slice_size, up_filename);  
+        }  
+    }  
+        
+    // 保存down_proj切片  
+    for (int expert_id = 0; expert_id < config_.expert_num; expert_id++) {  
+        for (int ith = 0; ith < nth_down; ith++) {  
+            size_t down_offset = (expert_id * config_.hidden_size + ith * config_.stride) *   
+                                config_.intermediate_size * ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
+            size_t down_slice_size = config_.stride * config_.intermediate_size *   
+                                    ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
+                
+            std::string down_filename = output_dir + "/down_expert_" + std::to_string(expert_id) +   
+                                        "_slice_" + std::to_string(ith) + ".bin";  
+            save_slice_to_file((uint8_t*)down_proj_ + down_offset, down_slice_size, down_filename);  
+        }  
+    }  
+        
+    // 保存元数据文件  
+    save_metadata(output_dir);  
+}  
+
+void MOE::save_slice_to_file(const void* data, size_t size, const std::string& filename) {  
+    std::ofstream file(filename, std::ios::binary);  
+    if (!file) {  
+        throw std::runtime_error("Failed to create file: " + filename);  
+    }  
+    file.write(static_cast<const char*>(data), size);  
+    file.close();  
+}  
+    
+void MOE::save_metadata(const std::string& output_dir) {
+    std::string metadata_file = output_dir + "/metadata.json";
+    std::ofstream file(metadata_file);
+    if (!file) {
+        throw std::runtime_error("Failed to create metadata file");
+    }
+
+    file << "{\n";
+    file << "  \"expert_num\": " << config_.expert_num << ",\n";
+    file << "  \"intermediate_size\": " << config_.intermediate_size << ",\n";
+    file << "  \"hidden_size\": " << config_.hidden_size << ",\n";
+    file << "  \"stride\": " << config_.stride << ",\n";
+    file << "  \"gate_type\": " << config_.gate_type << ",\n";
+    file << "  \"up_type\": " << config_.up_type << ",\n";
+    file << "  \"down_type\": " << config_.down_type << ",\n";
+    file << "  \"gate_slices_per_expert\": " << (config_.intermediate_size / config_.stride) << ",\n";
+    file << "  \"down_slices_per_expert\": " << (config_.hidden_size / config_.stride) << "\n";
+    file << "}\n";
+
+    file.close();
 }

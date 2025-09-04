@@ -25,8 +25,8 @@ rm -rf csrc/ktransformers_ext/cuda/dist
 rm -rf csrc/ktransformers_ext/cuda/*.egg-info
 rm -rf ~/.ktransformers
 echo "Installing python dependencies from requirements.txt"
-pip install -r requirements-local_chat.txt
-pip install -r ktransformers/server/requirements.txt
+proxychains pip install -r requirements-local_chat.txt
+proxychains pip install -r ktransformers/server/requirements.txt
 
 echo "Installing ktransformers"
 KTRANSFORMERS_FORCE_BUILD=TRUE pip install -v . --no-build-isolation

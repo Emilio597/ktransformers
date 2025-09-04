@@ -119,7 +119,7 @@ class Engine:
     cache: KDeepSeekV3Cache | KGQACache
     def __init__(self, args: ConfigArgs = default_args, generated_token_queue:Queue = None, broadcast_endpoint: str = None, kvcache_event: Event = None):
         self.args = args
-
+        print(f"DEBUG: Engine received slice_output_dir = {getattr(args, 'slice_output_dir', 'NOT_FOUND')}")  
         # 子进程和父进程无法共享 config 变量
         for key, value in vars(args).items():
             if value is not None and hasattr(Config(), key):
@@ -202,6 +202,9 @@ class Engine:
                 " belong to current model):"
             )
         optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, config)
+        slice_output_dir = getattr(args, 'slice_output_dir', None)  
+        if slice_output_dir:  
+            self._handle_weight_slices(slice_output_dir)  
         self.model.generation_config = generation_config
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
@@ -227,7 +230,73 @@ class Engine:
 
         self.sampler = Sampler()
         self.query_manager = QueryManager(device = self.device, page_size = args.page_size)
-
+  
+    def _handle_weight_slices(self, slice_output_dir: str):  
+        """处理权重切片的检查和保存"""  
+        import os  
+        import json  
+          
+        for name, module in self.model.named_modules():  
+            if hasattr(module, 'generate_experts') and hasattr(module.generate_experts, 'moe'):  
+                slice_dir = os.path.join(slice_output_dir, f"moe_slices_{name.replace('.', '_')}")  
+                  
+                # 检查是否需要保存切片  
+                need_save_slices = not self._check_slice_files_exist(slice_dir, module.generate_experts)  
+                  
+                if need_save_slices:  
+                    print(f"Saving weight slices for {name} to {slice_dir}")  
+                    os.makedirs(slice_dir, exist_ok=True)  
+                    module.generate_experts.moe.save_weight_slices(slice_dir)  
+                    print(f"Weight slices saved for {name}")  
+                else:  
+                    print(f"Weight slices already exist for {name} in {slice_dir}, skipping save")  
+  
+    def _check_slice_files_exist(self, slice_dir: str, experts_module) -> bool:  
+        """检查切片文件是否存在且完整"""  
+        import os  
+        import json  
+          
+        if not os.path.exists(slice_dir):  
+            return False  
+          
+        # 检查元数据文件  
+        metadata_file = os.path.join(slice_dir, "metadata.json")  
+        if not os.path.exists(metadata_file):  
+            return False  
+          
+        try:  
+            with open(metadata_file, 'r') as f:  
+                metadata = json.load(f)  
+              
+            # 验证元数据与当前配置是否匹配  
+            config = experts_module.config  
+            if (metadata.get("expert_num") != experts_module.n_routed_experts or  
+                metadata.get("intermediate_size") != config.moe_intermediate_size or  
+                metadata.get("hidden_size") != config.hidden_size):  
+                return False  
+              
+            # 检查所有切片文件是否存在  
+            gate_slices_per_expert = metadata.get("gate_slices_per_expert", 0)  
+            down_slices_per_expert = metadata.get("down_slices_per_expert", 0)  
+              
+            for expert_id in range(experts_module.n_routed_experts):  
+                # 检查gate和up切片  
+                for ith in range(gate_slices_per_expert):  
+                    gate_file = os.path.join(slice_dir, f"gate_expert_{expert_id}_slice_{ith}.bin")  
+                    up_file = os.path.join(slice_dir, f"up_expert_{expert_id}_slice_{ith}.bin")  
+                    if not os.path.exists(gate_file) or not os.path.exists(up_file):  
+                        return False  
+                  
+                # 检查down切片  
+                for ith in range(down_slices_per_expert):  
+                    down_file = os.path.join(slice_dir, f"down_expert_{expert_id}_slice_{ith}.bin")  
+                    if not os.path.exists(down_file):  
+                        return False  
+              
+            return True  
+        except Exception as e:  
+            print(f"Error checking slice files: {e}")  
+            return False
             
     def sampling(self, forward_output: ForwardBatchOutput):
         generated_tokens = torch.empty(0, device=self.device, dtype=torch.int32)

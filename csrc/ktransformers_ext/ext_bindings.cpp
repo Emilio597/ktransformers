@@ -696,7 +696,8 @@ PYBIND11_MODULE(cpuinfer_ext, m) {
     py::class_<MOE>(moe_module, "MOE")
         .def(py::init<MOEConfig>())
         .def("warm_up", &MOEBindings::WarmUpBindinds::cpuinfer_interface)
-        .def("forward", &MOEBindings::ForwardBindings::cpuinfer_interface);
+        .def("forward", &MOEBindings::ForwardBindings::cpuinfer_interface)
+        .def("save_weight_slices", &MOE::save_weight_slices); 
 
 
     #if defined(__x86_64__) && defined(__HAS_AVX512F__) && defined(__HAS_AMX__)

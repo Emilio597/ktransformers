@@ -14,10 +14,29 @@
 #include <climits>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <future>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
 #endif
+
+#define TIME_PERF
+#define JOB_DEBUG
+
+std::unique_ptr<SliceStreamer> MOE::streamer_;  
+std::once_flag MOE::streamer_init_flag_;  
+// LayoutHelper MOE::layout_helper_;  
+SliceShape MOE::slice_shape_;  
+int MOE::worker_threads_;
+// SSDStreamConfig MOE::ssd_cfg_;
 
 MOE::MOE(MOEConfig config) {
     config_ = config;
@@ -103,6 +122,25 @@ MOE::MOE(MOEConfig config) {
     m_local_intermediate_fp32_ptr_.resize(config_.expert_num);
     m_local_down_input_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
+
+    std::call_once(streamer_init_flag_, [&]() {  
+        slice_shape_.bytes_gate = (size_t)config_.stride * config_.hidden_size *  
+            ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
+        slice_shape_.bytes_up = (size_t)config_.stride * config_.hidden_size *  
+            ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
+        slice_shape_.bytes_down = (size_t)config_.stride * config_.intermediate_size *  
+            ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
+        slice_shape_.slices_gate_up = config_.intermediate_size / config_.stride;  
+        slice_shape_.slices_down = config_.hidden_size / config_.stride;  
+        worker_threads_ = std::max(1u, std::thread::hardware_concurrency());
+        streamer_.reset(new SliceStreamer(slice_shape_, worker_threads_, ssd_cfg_.buffers_per_thread));  
+        std::cout << "SliceStreamer init worker threads: "<<worker_threads_ << std::endl;
+    });  
+    layout_helper_.cfg = &ssd_cfg_;  
+    layout_helper_.shape = slice_shape_; 
+    if (slice_shape_.slices_gate_up !=  config_.intermediate_size / config_.stride) {  
+        throw std::runtime_error("MOE configuration mismatch with global SliceStreamer");  
+    }
 }
 
 MOE::~MOE() {
@@ -145,8 +183,10 @@ static float act_fn_relu(float x) {
     }
 }
 #ifdef TIME_PERF
-#include <mutex>
 std::mutex timing_mutex;
+#endif
+#ifdef JOB_DEBUG
+std::mutex count_mutex;
 #endif
 void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend) {
     const void* gate_input_ptr;
@@ -185,6 +225,11 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     long long down_min = LLONG_MAX;
     long long down_max = LLONG_MIN;
 #endif
+#ifdef JOB_DEBUG
+    int first_count = 0;
+    int ready_count = 0;
+    int memory_count = 0;
+#endif
     backend->do_work_stealing_job(nth * k, nullptr, [&](int task_id) {
 #ifdef TIME_PERF
         auto start_time = std::chrono::high_resolution_clock::now();  
@@ -193,20 +238,70 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
         uint64_t expert_id = expert_ids[expert_idx];
         int ith = task_id % nth;
         
-        #ifdef USE_NUMA
-        void* gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-        #else
-        void* gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-        #endif
+        void* gate_proj_ptr = nullptr;
+        void* up_proj_ptr   = nullptr;
+        bool submit=false;
+        SliceKey kg{ProjType::GATE, (int)expert_id, expert_idx, ith};
+        SliceKey ku{ProjType::UP, (int)expert_id, expert_idx, ith};
+        void* ready_ptr = nullptr;
+        if (ssd_cfg_.enable) {
+            if (!streamer_->has_inflight()) {
+                // case 1: 没有 inflight（首次）
+                if(!streamer_->ensure_inflight(kg, layout_helper_))
+                    assert(0);
+                if(!streamer_->ensure_inflight(ku, layout_helper_))
+                    assert(0);
+#ifdef JOB_DEBUG
+                {
+                    std::lock_guard<std::mutex> lock(count_mutex);
+                    // std::cout<<"[streamer] tid="<<streamer_->thread_index()<<" ensure_inflight" <<std::endl;
+                    first_count++;
+                }
+#endif
+                return; // 不算，直接返回
+            } 
+            auto ready_pair = streamer_->poll_if_all_ready(layout_helper_);
+            if (ready_pair) {
+                // case 2: inflight 有且 ready
+                auto p = ready_pair->ptrs;
+                auto key = ready_pair->key;
+                gate_proj_ptr = p[ProjType::GATE];
+                up_proj_ptr = p[ProjType::UP];
+                expert_id = key.expert;
+                expert_idx = key.expert_idx;
+                ith = key.ith;
+                submit = true;
+#ifdef JOB_DEBUG
+                {
+                    std::lock_guard<std::mutex> lock(count_mutex);
+                    ready_count++;
+                }
+#endif
+                // 算完才能释放 buffer，此时再下发当前任务
+            }
+        }
+        if(!gate_proj_ptr){
+            #ifdef USE_NUMA
+            gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+            #else
+            gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+            #endif
+            #ifdef USE_NUMA
+            up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+            #else
+            up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+            #endif
+
+#ifdef JOB_DEBUG
+                {
+                    std::lock_guard<std::mutex> lock(count_mutex);
+                    memory_count++;
+                }
+#endif
+        }
 
         float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
         llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
-
-        #ifdef USE_NUMA
-        void* up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-        #else
-        void* up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-        #endif
 
         float* up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
         llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, ggml_internal_get_type_traits(config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
@@ -226,6 +321,13 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             void* down_input_ptr = s_down_input_[expert_idx] + ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
             from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
         }
+        if(submit)
+        {
+            streamer_->mark_consumed_all();
+            streamer_->ensure_inflight(kg, layout_helper_);
+            streamer_->ensure_inflight(ku, layout_helper_);
+        }
+
 #ifdef TIME_PERF
         auto end_time = std::chrono::high_resolution_clock::now();  
         auto t = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
@@ -239,6 +341,83 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
 #endif
     }, nullptr);
 
+    if (ssd_cfg_.enable) {  
+        backend->do_work_stealing_job(worker_threads_, nullptr, [&](int thread_id) {  
+            // 每个线程处理自己的 inflight I/O  
+            if(streamer_->has_inflight_for_thread(thread_id)) {  
+                int expert_idx;
+                uint64_t expert_id;
+                int ith;
+                
+                void* gate_proj_ptr = nullptr;
+                void* up_proj_ptr   = nullptr;
+                auto ready_pair = streamer_->poll_if_all_ready_for_thread(thread_id, layout_helper_);  
+                if (ready_pair) {  
+                    // 数据已就绪，标记为消费完成  
+                    auto p = ready_pair->ptrs;
+                    auto key = ready_pair->key;
+                    gate_proj_ptr = p[ProjType::GATE];
+                    up_proj_ptr = p[ProjType::UP];
+                    expert_id = key.expert;
+                    expert_idx = key.expert_idx;
+                    ith = key.ith;
+                    streamer_->mark_consumed_all_for_thread(thread_id);  
+#ifdef JOB_DEBUG
+                {
+                    std::lock_guard<std::mutex> lock(count_mutex);
+                    ready_count++;
+                }
+#endif
+                    
+                } else {  
+                    // 数据未就绪，取消所有该线程的 inflight I/O  
+                    auto key = streamer_->cancel_inflight_for_thread(thread_id);  
+                    expert_id = key.expert;
+                    expert_idx = key.expert_idx;
+                    ith = key.ith;
+                    #ifdef USE_NUMA
+                    gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+                    #else
+                    gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+                    #endif
+
+                    #ifdef USE_NUMA
+                    up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+                    #else
+                    up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+                    #endif
+#ifdef JOB_DEBUG
+                {
+                    std::lock_guard<std::mutex> lock(count_mutex);
+                    memory_count++;
+                }
+#endif
+                }  
+
+                float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
+                llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+
+                float* up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
+                llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, ggml_internal_get_type_traits(config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+                if(config_.use_silu){
+                    // use silu as act fn
+                    for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
+                        s_intermediate_fp32_[expert_idx][i] = act_fn(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
+                    }
+                } else {
+                    // use relu as act fn
+                    for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
+                        s_intermediate_fp32_[expert_idx][i] = act_fn_relu(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
+                    }
+                }
+                if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) == 0) {
+                    float* intermediate_fp32_ptr = s_intermediate_fp32_[expert_idx] + ith * config_.stride;
+                    void* down_input_ptr = s_down_input_[expert_idx] + ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+                    from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+                }
+            }  
+        }, nullptr);  
+    }
     int gate_count = nth * k;
 #ifdef TIME_PERF
     double gate_avg = gate_count > 0 ? static_cast<double>(gate_total) / gate_count : 0.0;
@@ -248,6 +427,13 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     std::cout << " Avg: " << gate_avg << " μs" << std::endl;
     std::cout << " Min: " << gate_min << " μs" << std::endl;
     std::cout << " Max: " << gate_max << " μs" << std::endl;
+#endif
+#ifdef JOB_DEBUG
+    std::cout << " first_count: " << first_count <<  std::endl;
+    std::cout << " ready_count: " << ready_count <<  std::endl;
+    std::cout << " memory_count: " << memory_count <<  std::endl;
+    if(memory_count + ready_count != gate_count)
+        throw std::runtime_error("miss task found!"); 
 #endif
     if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) != 0) {
         for (int i = 0; i < k; i++) {
@@ -442,83 +628,136 @@ void MOE::forward(int qlen, int k, const uint64_t* expert_ids, const float* weig
     forward(qlen - forward_len, k, expert_ids + forward_len * k, weights + forward_len * k, (uint8_t*)input + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), (uint8_t*)output + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), batch_size_tensor, backend);
 }
 
+void MOE::enable_slice_compute(const std::string& slice_dir) { 
+    ssd_cfg_.slice_dir = slice_dir;
+    ssd_cfg_.enable = true;
+}
+
 void MOE::save_weight_slices(const std::string& output_dir) {  
     // 创建输出目录  
+    
     std::filesystem::create_directories(output_dir);  
-        
+      
     int nth_gate_up = config_.intermediate_size / config_.stride;  
     int nth_down = config_.hidden_size / config_.stride;  
-        
-    // 保存gate_proj和up_proj切片  
-    for (int expert_id = 0; expert_id < config_.expert_num; expert_id++) {  
-        for (int ith = 0; ith < nth_gate_up; ith++) {  
-            // Gate projection切片  
-            size_t gate_offset = (expert_id * config_.intermediate_size + ith * config_.stride) *   
-                                config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
-            size_t gate_slice_size = config_.stride * config_.hidden_size *   
-                                    ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
-                
-            std::string gate_filename = output_dir + "/gate_expert_" + std::to_string(expert_id) +   
-                                        "_slice_" + std::to_string(ith) + ".bin";  
-            save_slice_to_file((uint8_t*)gate_proj_ + gate_offset, gate_slice_size, gate_filename);  
-                
-            // Up projection切片  
-            size_t up_offset = (expert_id * config_.intermediate_size + ith * config_.stride) *   
-                                config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
-            size_t up_slice_size = config_.stride * config_.hidden_size *   
-                                    ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
-                
-            std::string up_filename = output_dir + "/up_expert_" + std::to_string(expert_id) +   
-                                    "_slice_" + std::to_string(ith) + ".bin";  
-            save_slice_to_file((uint8_t*)up_proj_ + up_offset, up_slice_size, up_filename);  
-        }  
-    }  
-        
-    // 保存down_proj切片  
-    for (int expert_id = 0; expert_id < config_.expert_num; expert_id++) {  
-        for (int ith = 0; ith < nth_down; ith++) {  
-            size_t down_offset = (expert_id * config_.hidden_size + ith * config_.stride) *   
-                                config_.intermediate_size * ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
-            size_t down_slice_size = config_.stride * config_.intermediate_size *   
-                                    ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
-                
-            std::string down_filename = output_dir + "/down_expert_" + std::to_string(expert_id) +   
-                                        "_slice_" + std::to_string(ith) + ".bin";  
-            save_slice_to_file((uint8_t*)down_proj_ + down_offset, down_slice_size, down_filename);  
-        }  
-    }  
-        
+      
+    // 固定使用PackedPerType布局  
+    save_weight_slices_packed(output_dir, nth_gate_up, nth_down);  
+      
     // 保存元数据文件  
     save_metadata(output_dir);  
 }  
-
-void MOE::save_slice_to_file(const void* data, size_t size, const std::string& filename) {  
-    std::ofstream file(filename, std::ios::binary);  
-    if (!file) {  
-        throw std::runtime_error("Failed to create file: " + filename);  
-    }  
-    file.write(static_cast<const char*>(data), size);  
-    file.close();  
+  
+void MOE::save_weight_slices_packed(const std::string& output_dir, int nth_gate_up, int nth_down) {  
+    const size_t align_bytes = 4096; // 4KB对齐  
+      
+    // 计算每种投影类型的切片大小  
+    size_t gate_slice_size = config_.stride * config_.hidden_size *   
+                            ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
+    size_t up_slice_size = config_.stride * config_.hidden_size *   
+                          ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
+    size_t down_slice_size = config_.stride * config_.intermediate_size *   
+                            ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
+      
+    // 计算对齐后的单元大小  
+    size_t gate_unit_size = align_up(gate_slice_size, align_bytes);  
+    size_t up_unit_size = align_up(up_slice_size, align_bytes);  
+    size_t down_unit_size = align_up(down_slice_size, align_bytes);  
+      
+    // 保存gate投影打包文件  
+    save_packed_projection(output_dir, "gate", ProjType::GATE, nth_gate_up,   
+                          gate_slice_size, gate_unit_size);  
+      
+    // 保存up投影打包文件  
+    save_packed_projection(output_dir, "up", ProjType::UP, nth_gate_up,   
+                          up_slice_size, up_unit_size);  
+      
+    // 保存down投影打包文件  
+    save_packed_projection(output_dir, "down", ProjType::DOWN, nth_down,   
+                          down_slice_size, down_unit_size);  
 }  
-    
-void MOE::save_metadata(const std::string& output_dir) {
-    std::string metadata_file = output_dir + "/metadata.json";
-    std::ofstream file(metadata_file);
-    if (!file) {
-        throw std::runtime_error("Failed to create metadata file");
-    }
-
-    file << "{\n";
-    file << "  \"expert_num\": " << config_.expert_num << ",\n";
-    file << "  \"intermediate_size\": " << config_.intermediate_size << ",\n";
-    file << "  \"hidden_size\": " << config_.hidden_size << ",\n";
-    file << "  \"stride\": " << config_.stride << ",\n";
-    file << "  \"gate_type\": " << config_.gate_type << ",\n";
-    file << "  \"up_type\": " << config_.up_type << ",\n";
-    file << "  \"down_type\": " << config_.down_type << ",\n";
-    file << "  \"gate_slices_per_expert\": " << (config_.intermediate_size / config_.stride) << ",\n";
-    file << "  \"down_slices_per_expert\": " << (config_.hidden_size / config_.stride) << "\n";
-    file << "}\n";
-
-    file.close();
+  
+void MOE::save_packed_projection(const std::string& output_dir, const std::string& proj_name,   
+                                ProjType proj_type, int slices_per_expert,   
+                                size_t slice_size, size_t unit_size) {  
+    std::string packed_filename = output_dir + "/" + proj_name + ".pack";  
+    std::ofstream packed_file(packed_filename, std::ios::binary);  
+    if (!packed_file) {  
+        int err = errno;
+        throw std::runtime_error("Failed to create packed file: " + packed_filename
+                                + " errno=" + std::to_string(err) + " (" + std::string(std::strerror(err)) + ")");
+    }  
+      
+    // 计算总文件大小  
+    size_t total_slices = config_.expert_num * slices_per_expert;  
+    size_t total_size = total_slices * unit_size;  
+      
+    // 创建对齐缓冲区  
+    std::vector<uint8_t> aligned_buffer(unit_size, 0);  
+      
+    for (int expert_id = 0; expert_id < config_.expert_num; expert_id++) {  
+        for (int ith = 0; ith < slices_per_expert; ith++) {  
+            // 清零缓冲区  
+            std::fill(aligned_buffer.begin(), aligned_buffer.end(), 0);  
+              
+            // 计算源数据偏移  
+            size_t src_offset;  
+            const uint8_t* src_ptr;  
+              
+            if (proj_type == ProjType::GATE) {  
+                src_offset = (expert_id * config_.intermediate_size + ith * config_.stride) *  
+                            config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);  
+                src_ptr = (uint8_t*)gate_proj_ + src_offset;  
+            } else if (proj_type == ProjType::UP) {  
+                src_offset = (expert_id * config_.intermediate_size + ith * config_.stride) *  
+                            config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);  
+                src_ptr = (uint8_t*)up_proj_ + src_offset;  
+            } else { // DOWN  
+                src_offset = (expert_id * config_.hidden_size + ith * config_.stride) *  
+                            config_.intermediate_size * ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type);  
+                src_ptr = (uint8_t*)down_proj_ + src_offset;  
+            }  
+              
+            // 复制数据到对齐缓冲区  
+            std::memcpy(aligned_buffer.data(), src_ptr, slice_size);  
+              
+            // 写入对齐的数据块  
+            packed_file.write(reinterpret_cast<const char*>(aligned_buffer.data()), unit_size);  
+            if (!packed_file) {  
+                throw std::runtime_error("Failed to write to packed file: " + packed_filename);  
+            }  
+        }  
+    }  
+      
+    packed_file.close();  
+    std::cout << "Saved packed " << proj_name << " projection to " << packed_filename   
+              << " (total size: " << total_size << " bytes)" << std::endl;  
+}  
+  
+size_t MOE::align_up(size_t x, size_t a) const {  
+    return (x + a - 1) / a * a;  
+}  
+  
+void MOE::save_metadata(const std::string& output_dir) {  
+    std::string metadata_file = output_dir + "/metadata.json";  
+    std::ofstream file(metadata_file);  
+    if (!file) {  
+        throw std::runtime_error("Failed to create metadata file");  
+    }  
+  
+    file << "{\n";  
+    file << "  \"expert_num\": " << config_.expert_num << ",\n";  
+    file << "  \"intermediate_size\": " << config_.intermediate_size << ",\n";  
+    file << "  \"hidden_size\": " << config_.hidden_size << ",\n";  
+    file << "  \"stride\": " << config_.stride << ",\n";  
+    file << "  \"gate_type\": " << config_.gate_type << ",\n";  
+    file << "  \"up_type\": " << config_.up_type << ",\n";  
+    file << "  \"down_type\": " << config_.down_type << ",\n";  
+    file << "  \"gate_slices_per_expert\": " << (config_.intermediate_size / config_.stride) << ",\n";  
+    file << "  \"down_slices_per_expert\": " << (config_.hidden_size / config_.stride) << ",\n";  
+    file << "  \"layout\": \"PackedPerType\",\n";  
+    file << "  \"align_bytes\": 4096\n";  
+    file << "}\n";  
+  
+    file.close();  
 }

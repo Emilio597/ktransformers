@@ -5,10 +5,10 @@ project(cpuinfer_ext VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 17)
 
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fopenmp")
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fopenmp")
 add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=${_GLIBCXX_USE_CXX11_ABI})
 set(CMAKE_BUILD_TYPE "Release")
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -ffast-math -fopenmp")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -ffast-math -fopenmp")
 # set(CMAKE_BUILD_TYPE "Debug")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -353,7 +353,20 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 message(STATUS "ARCH_FLAGS: ${ARCH_FLAGS}")
 pybind11_add_module(${PROJECT_NAME} MODULE ${ALL_SOURCES})
 target_link_libraries(${PROJECT_NAME} PRIVATE llama)
-
+  
+# 添加 io_uring 支持  
+option(USE_IO_URING "Enable io_uring support" ON)  
+  
+if(USE_IO_URING)  
+    find_library(URING_LIBRARY NAMES uring)  
+    if(URING_LIBRARY)  
+        message(STATUS "Found liburing: ${URING_LIBRARY}")  
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${URING_LIBRARY})  
+        target_compile_definitions(${PROJECT_NAME} PRIVATE USE_IO_URING)  
+    else()  
+        message(FATAL_ERROR "liburing not found - install liburing-dev package")  
+    endif()  
+endif()
 
 if(WIN32)
     target_link_libraries(${PROJECT_NAME} PRIVATE "$ENV{CUDA_PATH}/lib/x64/cudart.lib")#CUDA::cudart

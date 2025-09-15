@@ -28,8 +28,8 @@
 #include <numaif.h>
 #endif
 
-#define TIME_PERF
-#define JOB_DEBUG
+// #define TIME_PERF
+// #define JOB_DEBUG
 
 std::unique_ptr<SliceStreamer> MOE::streamer_;  
 std::once_flag MOE::streamer_init_flag_;  
@@ -248,9 +248,13 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             if (!streamer_->has_inflight()) {
                 // case 1: 没有 inflight（首次）
                 if(!streamer_->ensure_inflight(kg, layout_helper_))
+                {
                     assert(0);
+                }
                 if(!streamer_->ensure_inflight(ku, layout_helper_))
+                {
                     assert(0);
+                }
 #ifdef JOB_DEBUG
                 {
                     std::lock_guard<std::mutex> lock(count_mutex);
@@ -286,18 +290,19 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             #else
             gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
             #endif
-            #ifdef USE_NUMA
-            up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-            #else
-            up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-            #endif
-
 #ifdef JOB_DEBUG
                 {
                     std::lock_guard<std::mutex> lock(count_mutex);
                     memory_count++;
                 }
 #endif
+        }
+        if(!up_proj_ptr){
+            #ifdef USE_NUMA
+            up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+            #else
+            up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+            #endif
         }
 
         float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
@@ -365,27 +370,16 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
 #ifdef JOB_DEBUG
                 {
                     std::lock_guard<std::mutex> lock(count_mutex);
+                    assert(up_proj_ptr != nullptr && gate_proj_ptr!=nullptr);
                     ready_count++;
                 }
 #endif
-                    
                 } else {  
                     // 数据未就绪，取消所有该线程的 inflight I/O  
                     auto key = streamer_->cancel_inflight_for_thread(thread_id);  
                     expert_id = key.expert;
                     expert_idx = key.expert_idx;
-                    ith = key.ith;
-                    #ifdef USE_NUMA
-                    gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-                    #else
-                    gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-                    #endif
-
-                    #ifdef USE_NUMA
-                    up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-                    #else
-                    up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-                    #endif
+                    ith = key.ith;                    
 #ifdef JOB_DEBUG
                 {
                     std::lock_guard<std::mutex> lock(count_mutex);
@@ -393,7 +387,20 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
                 }
 #endif
                 }  
-
+                if(!gate_proj_ptr){
+                    #ifdef USE_NUMA
+                    gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+                    #else
+                    gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+                    #endif
+                }
+                if(!up_proj_ptr){
+                    #ifdef USE_NUMA
+                    up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+                    #else
+                    up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+                    #endif
+                }
                 float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
                 llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
 
@@ -418,8 +425,8 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             }  
         }, nullptr);  
     }
-    int gate_count = nth * k;
 #ifdef TIME_PERF
+    int gate_count = nth * k;
     double gate_avg = gate_count > 0 ? static_cast<double>(gate_total) / gate_count : 0.0;
     std::cout << "=== Forward One Timing Statistics ===" << std::endl;
     std::cout << "Gate+Up projection jobs:" << std::endl;

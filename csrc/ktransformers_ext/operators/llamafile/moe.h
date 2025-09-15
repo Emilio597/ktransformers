@@ -23,9 +23,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <fcntl.h>
-#ifdef USE_IO_URING
 #include <liburing.h>
-#endif
 
 #include "../../cpu_backend/backend.h"
 #include "../../cpu_backend/shared_mem_buffer.h"
@@ -77,7 +75,11 @@ struct LayoutHelper {
     }
 
     size_t slice_bytes(ProjType t) const {
-        return (t==ProjType::GATE) ? shape.bytes_gate : (t==ProjType::UP ? shape.bytes_up : shape.bytes_down);
+        // return (t==ProjType::GATE) ? shape.bytes_gate : (t==ProjType::UP ? shape.bytes_up : shape.bytes_down);
+        size_t raw = (t==ProjType::GATE) ? shape.bytes_gate
+                : (t==ProjType::UP)   ? shape.bytes_up
+                                : shape.bytes_down;
+        return align_up(raw, 4096); // 向上对齐到 4KB
     }
 
     // PackedPerType：每层每种类型 1 个文件，4KB 对齐
@@ -91,6 +93,11 @@ struct LayoutHelper {
     size_t linear_index(const SliceKey& k) const {
         int spp = (k.type==ProjType::DOWN)? shape.slices_down : shape.slices_gate_up;
         return static_cast<size_t>(k.expert) * spp + k.ith;
+    }
+
+    // 用于 inflight 唯一 ID
+    size_t inflight_index(const SliceKey& k) const {
+        return ((size_t)k.expert << 32) |  (((size_t)k.type + 1) << 24)  | (size_t)k.ith; //防止为0
     }
 
     size_t align_up(size_t x, size_t a) const { return (x + a - 1) / a * a; }
@@ -112,46 +119,12 @@ struct LayoutHelper {
     }
 };
 
-//     // 查询是否有已就绪的切片；若有，返回 (buffer 指针, key)
-//     std::optional<std::pair<uint8_t*, SliceKey>> poll_ready(){
-//         int tid = thread_index();
-//         auto &ctx = *ctxs_[tid];
-//         for (auto &b : ctx.bufs) {
-//             if (b->ready.load(std::memory_order_acquire)) {
-//                 b->ready.store(false, std::memory_order_release);
-//                 b->in_use.store(false, std::memory_order_release);
-//                 return std::make_optional(std::make_pair(b->data.get(), b->key));
-//             }
-//         }
-// #ifdef USE_IO_URING
-//         // 驱动 completion（非阻塞）
-//         if (ctx.ring_inited) {
-//             io_uring_cqe* cqe = nullptr;
-//             unsigned head;
-//             io_uring_for_each_cqe(&ctx.ring, head, cqe) {
-//                 Buffer* b = reinterpret_cast<Buffer*>(io_uring_cqe_get_data(cqe));
-//                 if (cqe->res >= 0) {
-//                     b->ready.store(true, std::memory_order_release);
-//                 } else {
-//                     // 读失败：降级为未就绪以便重试
-//                     b->in_use.store(false, std::memory_order_release);
-//                 }
-//                 io_uring_cqe_seen(&ctx.ring, cqe);
-//             }
-//             for (auto &b : ctx.bufs) if (b->ready.load()) {
-//                 b->ready.store(false); b->in_use.store(false); return std::make_optional(std::make_pair(b->data.get(), b->key));
-//             }
-//         }
-// #endif
-//         return std::nullopt;
-//     }
-
 
 // ============ SliceStreamer：每线程双缓冲 & 异步 I/O ============
 class SliceStreamer {
 public:
     struct Buffer {
-        std::unique_ptr<uint8_t[]> data;
+        std::unique_ptr<uint8_t, void(*)(void*)> data{nullptr, ::operator delete};
         size_t cap = 0;
         std::atomic<bool> in_use{false};
         std::atomic<bool> ready{false};
@@ -164,11 +137,9 @@ public:
 
     struct ThreadCtx {
         std::vector<std::unique_ptr<Buffer>> bufs;  // N 个缓冲（1 或 2）
-#ifdef USE_IO_URING
         io_uring ring{};            // 每线程 1 个队列
         bool ring_inited = false;
-#endif
-        std::unordered_map<size_t, int> in_flight; // linear_index -> buffer idx
+        std::vector<size_t> in_flight;
         std::unordered_map<std::string,int> fd_cache; // 路径 -> fd
         std::mutex mtx;
     };
@@ -181,23 +152,21 @@ public:
             ctxs_[t] = std::make_unique<ThreadCtx>();
             auto &ctx = *ctxs_[t];
             ctx.bufs.resize(per_thread_);
+            ctx.in_flight.resize(per_thread_, 0);
             for (auto &b : ctx.bufs) {
                 b = std::make_unique<Buffer>();
-                b->data.reset(new uint8_t[max_slice_]);
+                void* ptr = ::operator new(max_slice_, std::align_val_t(4096));
+                b->data = {reinterpret_cast<uint8_t*>(ptr), [](void* p){ ::operator delete(p, std::align_val_t(4096)); }};
                 b->cap = max_slice_;
             }
-        #ifdef USE_IO_URING
             if (io_uring_queue_init(256, &ctx.ring, 0) == 0) ctx.ring_inited = true;
-        #endif
         }
     }
 
     ~SliceStreamer(){
-    #ifdef USE_IO_URING
         for (auto &ctx_ptr : ctxs_) {
             if (ctx_ptr->ring_inited) io_uring_queue_exit(&ctx_ptr->ring);
         }
-    #endif
         for (auto &ctx_ptr : ctxs_) {
             for (auto &kv : ctx_ptr->fd_cache) {
                 if (kv.second >= 0) ::close(kv.second);
@@ -216,13 +185,27 @@ public:
 
     bool has_inflight() const {  
         int tid = thread_index();  
-        auto &ctx = *ctxs_[tid];  
-        return !ctx.in_flight.empty();  
+        return has_inflight_for_thread(tid);  
     }
     bool has_inflight_for_thread(int tid) const {  
         auto &ctx = *ctxs_[tid];  
-        return !ctx.in_flight.empty();  
+        bool has = false;
+        for (auto li : ctx.in_flight) {
+            if (li != 0) { has = true; break; }
+        }
+        return has;
     }
+
+    int inflight_size() const{
+        int tid = thread_index(); 
+        auto &ctx = *ctxs_[tid];  
+        int has = 0;
+        for (auto li : ctx.in_flight) {
+            if (li != 0) has++; 
+        }
+        return has;
+    }
+
 
     std::optional<ReadyTaskPointers> poll_if_all_ready(const LayoutHelper& lh_) {
         int tid = thread_index();
@@ -232,9 +215,12 @@ public:
     std::optional<ReadyTaskPointers> poll_if_all_ready_for_thread(int tid, const LayoutHelper& lh_) {
         auto &ctx = *ctxs_[tid];
 
-        if (ctx.in_flight.empty()) return std::nullopt;
+        int total_req = 0;
+        for (auto li : ctx.in_flight) {
+            if (li != 0) total_req++;
+        }
+        if (total_req == 0) return std::nullopt;
 
-    #ifdef USE_IO_URING
         // 1. 驱动IO完成队列
         if (ctx.ring_inited) {
             io_uring_cqe* cqe = nullptr;
@@ -249,19 +235,20 @@ public:
                                 b->key.expert, b->key.ith, cqe->res);
                         // IO失败，释放buffer并从inflight移除
                         b->in_use.store(false, std::memory_order_release);
-                        size_t li = lh_.linear_index(b->key);
-                        ctx.in_flight.erase(li);
+                        b->ready.store(false, std::memory_order_release);
+                        size_t li = lh_.inflight_index(b->key);
+                        for (auto &slot : ctx.in_flight) {
+                            if (slot == li) {
+                                slot = 0; // 清除占用
+                                break;
+                            }
+                        }
                     }
                 }
                 // 消费(acknowledges)这个完成事件
                 io_uring_cqe_seen(&ctx.ring, cqe);
             }
         }
-    #endif
-
-        // 2. 检查是否所有在途(in_flight)的请求都已就绪
-        // 注意：如果IO失败，in_flight条目会被移除，所以这个检查依然是正确的
-        if (ctx.in_flight.empty()) return std::nullopt; // 可能所有请求都失败了
 
         int ready_count = 0;
         for (const auto& b : ctx.bufs) {
@@ -270,16 +257,12 @@ public:
             }
         }
 
-        if (ready_count > 0 && ready_count == ctx.in_flight.size()) {
+        if (ready_count > 0 && ready_count == total_req) {
             ReadyTaskPointers result;
-            bool key_saved = false;
             for (const auto& b : ctx.bufs) {
                 if (b->in_use.load(std::memory_order_acquire)) {
                     result.ptrs[b->key.type] = b->data.get();
-                    if (!key_saved) {
-                        result.key = b->key;
-                        key_saved = true;
-                    }
+                    result.key = b->key;
                     b->ready.store(false, std::memory_order_relaxed);
                 }
             }
@@ -296,19 +279,16 @@ public:
         
         cancelled_key = ctx.bufs[0]->key;
         
-    #ifdef USE_IO_URING  
         if (ctx.ring_inited) {  
             // 使用 io_uring_prep_cancel 取消特定的 I/O 操作  
-            for (const auto& [linear_idx, buffer_idx] : ctx.in_flight) {  
-                if (buffer_idx < ctx.bufs.size()) {  
-                    auto &buffer = ctx.bufs[buffer_idx];  
-                    
-                    // 准备取消操作  
+            for (int buf_idx = 0; buf_idx < (int)ctx.bufs.size(); ++buf_idx) {  
+                if (ctx.in_flight[buf_idx] != 0) { // 有在途请求  
+                    auto &buffer = ctx.bufs[buf_idx];  
+
                     io_uring_sqe* cancel_sqe = io_uring_get_sqe(&ctx.ring);  
                     if (cancel_sqe) {  
-                        // 使用 buffer 地址作为 user_data 来标识要取消的操作  
                         io_uring_prep_cancel(cancel_sqe, buffer.get(), 0);  
-                        io_uring_sqe_set_data(cancel_sqe, nullptr); // 取消操作不需要回调  
+                        io_uring_sqe_set_data(cancel_sqe, nullptr);  
                     }  
                 }  
             }  
@@ -324,7 +304,6 @@ public:
                 io_uring_cqe_seen(&ctx.ring, cqe);  
             }  
         }  
-    #endif  
         
         // 重置所有该线程的 buffer 状态  
         for (auto &b : ctx.bufs) {  
@@ -333,7 +312,7 @@ public:
         }  
         
         // 清空该线程的 inflight 映射  
-        ctx.in_flight.clear();  
+        std::fill(ctx.in_flight.begin(), ctx.in_flight.end(), 0); 
         
         return cancelled_key;  
     }
@@ -348,7 +327,7 @@ public:
                 b->in_use.store(false, std::memory_order_release);
             }
         }
-        ctx.in_flight.clear();
+        std::fill(ctx.in_flight.begin(), ctx.in_flight.end(), 0);
     }
 
     void mark_consumed_all_for_thread(int tid) {
@@ -359,15 +338,46 @@ public:
                 b->in_use.store(false, std::memory_order_release);
             }
         }
-        ctx.in_flight.clear();
+        std::fill(ctx.in_flight.begin(), ctx.in_flight.end(), 0);
+    }
+
+    // 查询是否有已就绪的切片；若有，返回 (buffer 指针, key)
+    std::optional<std::pair<uint8_t*, SliceKey>> poll_ready(){
+        int tid = thread_index();
+        auto &ctx = *ctxs_[tid];
+
+        // 驱动 completion（非阻塞）
+        if (ctx.ring_inited) {
+            io_uring_cqe* cqe = nullptr;
+            unsigned head;
+            io_uring_for_each_cqe(&ctx.ring, head, cqe) {
+                Buffer* b = reinterpret_cast<Buffer*>(io_uring_cqe_get_data(cqe));
+                if (cqe->res >= 0) {
+                    b->ready.store(true, std::memory_order_release);
+                } else {
+                    // 读失败：降级为未就绪以便重试
+                    fprintf(stderr, "io_uring read failed for expert %d slice %d with code: %d\n", 
+                                b->key.expert, b->key.ith, cqe->res);
+                    b->in_use.store(false, std::memory_order_release);
+                }
+                io_uring_cqe_seen(&ctx.ring, cqe);
+            }
+        }
+        for (auto &b : ctx.bufs) if (b->ready.load()) {
+                b->ready.store(false); b->in_use.store(false); 
+                return std::make_optional(std::make_pair(b->data.get(), b->key));
+            }
+        return std::nullopt;
     }
 
     // 若该切片未在途，则占用一个空闲 buffer 并下发读取；返回是否成功发起
     bool ensure_inflight(const SliceKey& key,const LayoutHelper& lh_){
         int tid = thread_index();
         auto &ctx = *ctxs_[tid];
-        size_t li = lh_.linear_index(key);
-        if (ctx.in_flight.count(li)) return true; // 已在途
+        size_t li = lh_.inflight_index(key);
+        for (size_t infl : ctx.in_flight) {
+            if (infl == li) return true; // 已在途
+        }
         // 找空闲 buffer
         for (int i = 0; i < per_thread_; ++i) {
             auto &b = ctx.bufs[i];
@@ -387,33 +397,29 @@ public:
                         flags |= O_DIRECT; // 提升吞吐（注意对齐要求）
 #endif
                         fd = ::open(plan.owned_path.c_str(), flags);
-                        ctx.fd_cache[plan.owned_path] = fd;
+                        if (fd < 0) {
+                            // 打印失败原因
+                            fprintf(stderr, "Failed to open file '%s': %s (errno=%d)\n",
+                                    plan.owned_path.c_str(), strerror(errno), errno);
+                            assert(0);
+                        } else {
+                            ctx.fd_cache[plan.owned_path] = fd;
+                        }
                     } else fd = it->second;
                 }
                 if (fd < 0) { b->in_use.store(false); return false; }
-#ifdef USE_IO_URING
                 if (ctx.ring_inited) {
                     io_uring_sqe* sqe = io_uring_get_sqe(&ctx.ring);
-                    if (!sqe) { b->in_use.store(false); return false; }
+                    if (!sqe) { b->in_use.store(false); assert(0);return false; }
                     io_uring_prep_read(sqe, fd, b->data.get(), (unsigned)plan.len, plan.off);
                     io_uring_sqe_set_data(sqe, b.get());
                     io_uring_submit(&ctx.ring);
-                } else
-#endif
-                {
-                    // 回退：同步 pread（仍然通过状态机）
-                    ssize_t n = ::pread(fd, b->data.get(), plan.len, plan.off);
-                    if (n == (ssize_t)plan.len) {
-                        b->ready.store(true, std::memory_order_release);
-                    } else {
-                        b->in_use.store(false, std::memory_order_release);
-                        return false;
-                    }
                 }
-                ctx.in_flight[li] = i;
+                ctx.in_flight[i] = li;
                 return true;
             }
         }
+        assert(0);
         return false; // 无可用 buffer
     }
 

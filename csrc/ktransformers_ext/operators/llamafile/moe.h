@@ -387,7 +387,7 @@ public:
                 if (fd < 0) { b->in_use.store(false); return false; }
                 if (ctx.ring_inited) {
                     io_uring_sqe* sqe = io_uring_get_sqe(&ctx.ring);
-                    if (!sqe) { b->in_use.store(false); assert(0);return false; }
+                    if (!sqe) { b->in_use.store(false); return false; }
                     io_uring_prep_read(sqe, fd, b->data.get(), (unsigned)plan.len, plan.off);
                     io_uring_sqe_set_data(sqe, b.get());
                     io_uring_submit(&ctx.ring);
@@ -396,7 +396,6 @@ public:
                 return true;
             }
         }
-        assert(0);
         return false; // 无可用 buffer
     }
     // 在 SliceStreamer 类中新增  
@@ -435,7 +434,7 @@ public:
                 if (fd < 0) {  
                     fprintf(stderr, "Failed to open file '%s': %s (errno=%d)\\n",  
                             path_buf, strerror(errno), errno);  
-                    assert(0);  
+                    std::exit(EXIT_FAILURE); 
                 }  
                 shared_fd_cache_[layer_id][proj_idx] = fd;  
             }  

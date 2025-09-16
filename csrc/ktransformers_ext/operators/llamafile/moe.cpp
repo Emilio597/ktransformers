@@ -253,13 +253,9 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
         if (ssd_cfg_.enable) {
             if (!streamer_->has_inflight()) {
                 // case 1: 没有 inflight（首次）
-                if(!streamer_->ensure_inflight(kg, layout_helper_))
+                if((!streamer_->ensure_inflight(kg, layout_helper_)) || (!streamer_->ensure_inflight(ku, layout_helper_)))
                 {
-                    assert(0);
-                }
-                if(!streamer_->ensure_inflight(ku, layout_helper_))
-                {
-                    assert(0);
+                    std::exit(EXIT_FAILURE);
                 }
 #ifdef JOB_DEBUG
                 {

@@ -9,6 +9,9 @@
  **/
 
 #include "backend.h"
+#include <sys/syscall.h>  
+#include <unistd.h>  
+#include <fstream>
 
 #ifdef USE_NUMA
 #include <numa.h>
@@ -19,17 +22,27 @@ thread_local int Backend::numa_node = -1;
 
 thread_local int Backend::thread_local_id = -1;
 
+// 添加 thread_local 变量  
+thread_local ThreadType Backend::thread_type_ = ThreadType::MEMORY_THREAD;  
+
 Backend::Backend(int max_thread_num) {
     max_thread_num_ = max_thread_num;
+    io_threads_count_ = max_thread_num / 2;
+
     thread_state_.resize(max_thread_num_);
     for (int i = 0; i < max_thread_num_; i++) {
         thread_state_[i].curr = std::make_unique<std::atomic<int>>();
         thread_state_[i].status =
             std::make_unique<std::atomic<ThreadStatus>>(ThreadStatus::WAITING);
     }
+    thread_type_ = ThreadType::MEMORY_THREAD;  
+    bind_thread_to_resctrl(0, ThreadType::MEMORY_THREAD); 
+
     workers_.resize(max_thread_num_);
     for (int i = 1; i < max_thread_num_; i++) {
-        workers_[i] = std::thread(&Backend::worker_thread, this, i);
+        ThreadType type = (i <= io_threads_count_) ?   
+            ThreadType::IO_THREAD : ThreadType::MEMORY_THREAD; 
+        workers_[i] = std::thread(&Backend::worker_thread, this, i, type);
     }
 }
 
@@ -44,6 +57,26 @@ Backend::~Backend() {
         }
     }
 }
+
+// 添加resctrl绑定函数  
+void Backend::bind_thread_to_resctrl(int thread_id, ThreadType type) {  
+    const char* cgroup_path = (type == ThreadType::IO_THREAD) ?   
+        "/sys/fs/resctrl/io_group/tasks" :   
+        "/sys/fs/resctrl/memory_group/tasks";  
+      
+    std::ofstream tasks_file(cgroup_path);  
+    if (tasks_file.is_open()) {  
+        tasks_file << syscall(SYS_gettid) << std::endl;  
+        tasks_file.close();  
+        thread_type_ = type;  
+        printf("Thread %d bound to %s group\\n", thread_id,   
+               (type == ThreadType::IO_THREAD) ? "IO" : "MEMORY");  
+    } else {  
+        fprintf(stderr, "Failed to bind thread %d to resctrl group %s\\n",   
+                thread_id, cgroup_path);  
+        std::exit(EXIT_FAILURE);
+    }  
+}  
 
 int Backend::get_thread_num() { return max_thread_num_; }
 
@@ -129,9 +162,10 @@ void Backend::process_tasks(int thread_id) {
                                            std::memory_order_release);
 }
 
-void Backend::worker_thread(int thread_id) {
+void Backend::worker_thread(int thread_id, ThreadType type) {
     auto start = std::chrono::steady_clock::now();
     thread_local_id = thread_id; // 设置线程本地变量
+    bind_thread_to_resctrl(thread_id, type);  
     while (true) {
         ThreadStatus status =
             thread_state_[thread_id].status->load(std::memory_order_acquire);

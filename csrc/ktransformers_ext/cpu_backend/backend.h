@@ -16,7 +16,13 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <fstream>  
 #include <vector>
+
+enum class ThreadType {  
+    IO_THREAD,  
+    MEMORY_THREAD  
+};  
 
 enum ThreadStatus {
     WORKING,
@@ -42,8 +48,12 @@ class Backend {
     static thread_local int numa_node;
     #endif
     static thread_local int thread_local_id;
+    static ThreadType get_thread_type() { return thread_type_; }
+    void bind_thread_to_resctrl(int thread_id, ThreadType type);  
 
   private:
+    static thread_local ThreadType thread_type_;  
+    int io_threads_count_;  
     int thread_num_;
     int max_thread_num_;
     std::vector<ThreadState> thread_state_; // [thread_num]
@@ -53,6 +63,6 @@ class Backend {
     std::vector<std::thread> workers_;
 
     void process_tasks(int);
-    void worker_thread(int);
+    void worker_thread(int thread_id, ThreadType type);
 };
 #endif

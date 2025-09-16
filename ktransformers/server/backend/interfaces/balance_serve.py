@@ -262,7 +262,7 @@ class Engine:
                     print(f"Weight slices saved for {name}")  
                 else:  
                     print(f"Weight slices already exist for {name} in {slice_dir}, skipping save")  
-                module.generate_experts.moe.enable_slice_compute(slice_dir)
+                module.generate_experts.moe.enable_slice_compute(slice_dir, int(m.group(1)))
   
     def _check_slice_files_exist(self, slice_dir: str, experts_module) -> bool:
         """检查PackedPerType切片文件是否存在且完整"""

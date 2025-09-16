@@ -28,6 +28,7 @@
 #include <numaif.h>
 #endif
 
+#define MAX_LAYER 100
 // #define TIME_PERF
 // #define JOB_DEBUG
 
@@ -37,6 +38,10 @@ std::once_flag MOE::streamer_init_flag_;
 SliceShape MOE::slice_shape_;  
 int MOE::worker_threads_;
 // SSDStreamConfig MOE::ssd_cfg_;
+
+std::vector<std::vector<int>> SliceStreamer::shared_fd_cache_;  
+// std::mutex SliceStreamer::fd_cache_mutex_;  
+bool SliceStreamer::fd_cache_initialized_ = false;
 
 MOE::MOE(MOEConfig config) {
     config_ = config;
@@ -134,6 +139,7 @@ MOE::MOE(MOEConfig config) {
         slice_shape_.slices_down = config_.hidden_size / config_.stride;  
         worker_threads_ = std::max(1u, std::thread::hardware_concurrency());
         streamer_.reset(new SliceStreamer(slice_shape_, worker_threads_, ssd_cfg_.buffers_per_thread));  
+        SliceStreamer::initialize_fd_cache(MAX_LAYER);//暂时固化，python端未传递层数
         std::cout << "SliceStreamer init worker threads: "<<worker_threads_ << std::endl;
     });  
     layout_helper_.cfg = &ssd_cfg_;  
@@ -635,9 +641,13 @@ void MOE::forward(int qlen, int k, const uint64_t* expert_ids, const float* weig
     forward(qlen - forward_len, k, expert_ids + forward_len * k, weights + forward_len * k, (uint8_t*)input + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), (uint8_t*)output + forward_len * config_.hidden_size * ggml_type_size(config_.hidden_type) / ggml_blck_size(config_.hidden_type), batch_size_tensor, backend);
 }
 
-void MOE::enable_slice_compute(const std::string& slice_dir) { 
+void MOE::enable_slice_compute(const std::string& slice_dir, int layer_id) { 
     ssd_cfg_.slice_dir = slice_dir;
     ssd_cfg_.enable = true;
+    
+    ssd_cfg_.layer_id = layer_id; // 默认值  
+    // 预先打开该层的所有文件  
+    SliceStreamer::open_layer_files(ssd_cfg_.layer_id, slice_dir);  
 }
 
 void MOE::save_weight_slices(const std::string& output_dir) {  

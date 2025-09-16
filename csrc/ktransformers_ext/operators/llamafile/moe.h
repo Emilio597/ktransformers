@@ -38,6 +38,7 @@ struct SSDStreamConfig {
     int buffers_per_thread = 2; // 1 或 2（建议 2 为双缓冲）
     bool enable = false; // 开关
     // enum Layout { SeparateFiles = 0, PackedPerType = 1 } layout = SeparateFiles;
+    int layer_id = -1;
     size_t align_bytes = 4096; // PackedPerType 对齐粒度
 };
 
@@ -140,7 +141,7 @@ public:
         io_uring ring{};            // 每线程 1 个队列
         bool ring_inited = false;
         std::vector<size_t> in_flight;
-        std::unordered_map<std::string,int> fd_cache; // 路径 -> fd
+        // std::unordered_map<std::string,int> fd_cache; // 路径 -> fd
         std::mutex mtx;
     };
 
@@ -166,11 +167,6 @@ public:
     ~SliceStreamer(){
         for (auto &ctx_ptr : ctxs_) {
             if (ctx_ptr->ring_inited) io_uring_queue_exit(&ctx_ptr->ring);
-        }
-        for (auto &ctx_ptr : ctxs_) {
-            for (auto &kv : ctx_ptr->fd_cache) {
-                if (kv.second >= 0) ::close(kv.second);
-            }
         }
     }
 
@@ -387,26 +383,7 @@ public:
                 b->key = key;
                 // 打开文件 & 计算偏移
                 auto plan = lh_.plan(key);
-                int fd = -1;
-                {
-                    std::lock_guard<std::mutex> lk(ctx.mtx);
-                    auto it = ctx.fd_cache.find(plan.owned_path);
-                    if (it == ctx.fd_cache.end()) {
-                        int flags = O_RDONLY | O_CLOEXEC;
-#ifdef O_DIRECT
-                        flags |= O_DIRECT; // 提升吞吐（注意对齐要求）
-#endif
-                        fd = ::open(plan.owned_path.c_str(), flags);
-                        if (fd < 0) {
-                            // 打印失败原因
-                            fprintf(stderr, "Failed to open file '%s': %s (errno=%d)\n",
-                                    plan.owned_path.c_str(), strerror(errno), errno);
-                            assert(0);
-                        } else {
-                            ctx.fd_cache[plan.owned_path] = fd;
-                        }
-                    } else fd = it->second;
-                }
+                int fd = get_fd(lh_.cfg->layer_id, key.type);  
                 if (fd < 0) { b->in_use.store(false); return false; }
                 if (ctx.ring_inited) {
                     io_uring_sqe* sqe = io_uring_get_sqe(&ctx.ring);
@@ -422,9 +399,74 @@ public:
         assert(0);
         return false; // 无可用 buffer
     }
+    // 在 SliceStreamer 类中新增  
+    static void initialize_fd_cache(int max_layers) {  
+        // std::lock_guard<std::mutex> lock(fd_cache_mutex_);  
+        if (!fd_cache_initialized_) {  
+            shared_fd_cache_.resize(max_layers);  
+            for (auto& layer_fds : shared_fd_cache_) {  
+                layer_fds.resize(3, -1); // 3个投影类型：GATE, UP, DOWN  
+            }  
+            fd_cache_initialized_ = true;  
+        }  
+    }  
+    
+    static void open_layer_files(int layer_id, const std::string& slice_dir) {  
+        // std::lock_guard<std::mutex> lock(fd_cache_mutex_);  
+        if (layer_id >= shared_fd_cache_.size()) {  
+            shared_fd_cache_.resize(layer_id + 1);  
+            for (int i = shared_fd_cache_.size() - (layer_id + 1 - shared_fd_cache_.size());   
+                i <= layer_id; ++i) {  
+                shared_fd_cache_[i].resize(3, -1);  
+            }  
+        }  
+        
+        // 打开三个投影文件  
+        std::vector<std::string> proj_names = {"gate", "up", "down"};  
+        for (int proj_idx = 0; proj_idx < 3; ++proj_idx) {  
+            if (shared_fd_cache_[layer_id][proj_idx] == -1) {  
+                char path_buf[512];  
+                ::snprintf(path_buf, sizeof(path_buf), "%s/%s.pack",   
+                        slice_dir.c_str(), proj_names[proj_idx].c_str());  
+                
+                int flags = O_RDONLY | O_CLOEXEC;  
+                flags |= O_DIRECT;  
+                int fd = ::open(path_buf, flags);  
+                if (fd < 0) {  
+                    fprintf(stderr, "Failed to open file '%s': %s (errno=%d)\\n",  
+                            path_buf, strerror(errno), errno);  
+                    assert(0);  
+                }  
+                shared_fd_cache_[layer_id][proj_idx] = fd;  
+            }  
+        }  
+    }  
+    
+    static void cleanup_shared_resources() {  
+        // std::lock_guard<std::mutex> lock(SliceStreamer::fd_cache_mutex_);  
+        for (auto& layer_fds : SliceStreamer::shared_fd_cache_) {  
+            for (int fd : layer_fds) {  
+                if (fd >= 0) ::close(fd);  
+            }  
+        }  
+        SliceStreamer::shared_fd_cache_.clear();  
+        SliceStreamer::fd_cache_initialized_ = false;  
+    }
+
+    static int get_fd(int layer_id, ProjType proj_type) {  
+        // std::lock_guard<std::mutex> lock(fd_cache_mutex_);  
+        if (layer_id >= shared_fd_cache_.size() ||   
+            shared_fd_cache_[layer_id][(int)proj_type] == -1) {  
+            return -1;  
+        }  
+        return shared_fd_cache_[layer_id][(int)proj_type];  
+    }
 
 private:
     // LayoutHelper lh_;
+    static std::vector<std::vector<int>> shared_fd_cache_;  
+    // static std::mutex fd_cache_mutex_;  
+    static bool fd_cache_initialized_;  
     int threads_ = 1;
     int per_thread_ = 2;
     size_t max_slice_ = 0;
@@ -462,7 +504,7 @@ class MOE {
     void forward_one(int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend);
     void forward_many(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, Backend* backend);
     void forward(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, int* batch_size_tensor, Backend* backend);
-    void enable_slice_compute(const std::string& slice_dir);
+    void enable_slice_compute(const std::string& slice_dir, int layer_id);
     void save_weight_slices(const std::string& output_dir);  
     void save_weight_slices_packed(const std::string& output_dir, int nth_gate_up, int nth_down);  
     void save_packed_projection(const std::string& output_dir, const std::string& proj_name,   

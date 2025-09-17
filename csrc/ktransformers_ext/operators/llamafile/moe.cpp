@@ -235,7 +235,10 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     int first_count = 0;
     int ready_count = 0;
     int memory_count = 0;
+    int timeout_count = 0;
 #endif
+    // remaining_tasks.store(nth * k, std::memory_order_relaxed);
+    // int degrade_threshold = backend->get_iothread_num()/2;
     backend->do_work_stealing_job(nth * k, nullptr, [&](int task_id) {
 #ifdef TIME_PERF
         auto start_time = std::chrono::high_resolution_clock::now();  
@@ -246,11 +249,14 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
         
         void* gate_proj_ptr = nullptr;
         void* up_proj_ptr   = nullptr;
-        bool submit=false;
-        SliceKey kg{ProjType::GATE, (int)expert_id, expert_idx, ith};
-        SliceKey ku{ProjType::UP, (int)expert_id, expert_idx, ith};
-        void* ready_ptr = nullptr;
-        if (ssd_cfg_.enable) {
+        bool io_catch = false;
+        ThreadType current_type = Backend::get_thread_type();  
+        if (ssd_cfg_.enable && current_type == ThreadType::IO_THREAD) {
+            // if (remaining_tasks.load(std::memory_order_acquire) < degrade_threshold) {
+            //     goto MEMORY_FALLBACK;
+            // }
+            SliceKey kg{ProjType::GATE, (int)expert_id, expert_idx, ith};
+            SliceKey ku{ProjType::UP, (int)expert_id, expert_idx, ith};
             if (!streamer_->has_inflight()) {
                 // case 1: 没有 inflight（首次）
                 if((!streamer_->ensure_inflight(kg, layout_helper_)) || (!streamer_->ensure_inflight(ku, layout_helper_)))
@@ -264,33 +270,65 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
                     first_count++;
                 }
 #endif
-                return; // 不算，直接返回
-            } 
-            auto ready_pair = streamer_->poll_if_all_ready(layout_helper_);
-            if (ready_pair) {
-                // case 2: inflight 有且 ready
-                auto p = ready_pair->ptrs;
-                auto key = ready_pair->key;
-                gate_proj_ptr = p[ProjType::GATE];
-                up_proj_ptr = p[ProjType::UP];
-                expert_id = key.expert;
-                expert_idx = key.expert_idx;
-                ith = key.ith;
-                submit = true;
-#ifdef JOB_DEBUG
-                {
-                    std::lock_guard<std::mutex> lock(count_mutex);
-                    ready_count++;
-                }
-#endif
-                // 算完才能释放 buffer，此时再下发当前任务
+                usleep(200);
             }
+            else
+                assert(0);
+            int count=0;
+            do{
+                auto ready_pair = streamer_->poll_if_all_ready(layout_helper_);
+                if (ready_pair) {
+                    // case 2: inflight 有且 ready
+                    auto p = ready_pair->ptrs;
+                    // auto key = ready_pair->key;
+                    gate_proj_ptr = p[ProjType::GATE];
+                    up_proj_ptr = p[ProjType::UP];
+                    io_catch = true;
+                    // expert_id = key.expert;
+                    // expert_idx = key.expert_idx;
+                    // ith = key.ith;
+    #ifdef JOB_DEBUG
+                    {
+                        std::lock_guard<std::mutex> lock(count_mutex);
+                        ready_count++;
+                    }
+    #endif
+                    break;
+                }
+                else
+                {
+                    count++;
+                    if(count>3)
+                    {
+                        #ifdef JOB_DEBUG
+                        {
+                            std::lock_guard<std::mutex> lock(count_mutex);
+                            timeout_count++;
+                        }
+                        #endif
+                        streamer_->cancel_inflight();
+                        goto MEMORY_FALLBACK;
+                    }
+                    // if (remaining_tasks.load(std::memory_order_acquire) < degrade_threshold) {
+                    //     goto MEMORY_FALLBACK;
+                    // }
+                    // streamer_->cancel_inflight();
+                    usleep(100);
+                }
+            }while(1);
         }
+MEMORY_FALLBACK:
         if(!gate_proj_ptr){
             #ifdef USE_NUMA
             gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
             #else
             gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+            #endif
+
+            #ifdef USE_NUMA
+            up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+            #else
+            up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
             #endif
 #ifdef JOB_DEBUG
                 {
@@ -298,13 +336,6 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
                     memory_count++;
                 }
 #endif
-        }
-        if(!up_proj_ptr){
-            #ifdef USE_NUMA
-            up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-            #else
-            up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-            #endif
         }
 
         float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
@@ -328,13 +359,10 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
             void* down_input_ptr = s_down_input_[expert_idx] + ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
             from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
         }
-        if(submit)
-        {
+        // remaining_tasks.fetch_sub(1, std::memory_order_acq_rel);
+        if(io_catch)
             streamer_->mark_consumed_all();
-            streamer_->ensure_inflight(kg, layout_helper_);
-            streamer_->ensure_inflight(ku, layout_helper_);
-        }
-
+        
 #ifdef TIME_PERF
         auto end_time = std::chrono::high_resolution_clock::now();  
         auto t = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
@@ -348,85 +376,85 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
 #endif
     }, nullptr);
 
-    if (ssd_cfg_.enable) {  
-        backend->do_work_stealing_job(worker_threads_, nullptr, [&](int thread_id) {  
-            // 每个线程处理自己的 inflight I/O  
-            if(streamer_->has_inflight_for_thread(thread_id)) {  
-                int expert_idx;
-                uint64_t expert_id;
-                int ith;
+//     if (ssd_cfg_.enable) {  
+//         backend->do_work_stealing_job(worker_threads_, nullptr, [&](int thread_id) {  
+//             // 每个线程处理自己的 inflight I/O  
+//             if(streamer_->has_inflight_for_thread(thread_id)) {  
+//                 int expert_idx;
+//                 uint64_t expert_id;
+//                 int ith;
                 
-                void* gate_proj_ptr = nullptr;
-                void* up_proj_ptr   = nullptr;
-                auto ready_pair = streamer_->poll_if_all_ready_for_thread(thread_id, layout_helper_);  
-                if (ready_pair) {  
-                    // 数据已就绪，标记为消费完成  
-                    auto p = ready_pair->ptrs;
-                    auto key = ready_pair->key;
-                    gate_proj_ptr = p[ProjType::GATE];
-                    up_proj_ptr = p[ProjType::UP];
-                    expert_id = key.expert;
-                    expert_idx = key.expert_idx;
-                    ith = key.ith;
-                    streamer_->mark_consumed_all_for_thread(thread_id);  
-#ifdef JOB_DEBUG
-                {
-                    std::lock_guard<std::mutex> lock(count_mutex);
-                    assert(up_proj_ptr != nullptr && gate_proj_ptr!=nullptr);
-                    ready_count++;
-                }
-#endif
-                } else {  
-                    // 数据未就绪，取消所有该线程的 inflight I/O  
-                    auto key = streamer_->cancel_inflight_for_thread(thread_id);  
-                    expert_id = key.expert;
-                    expert_idx = key.expert_idx;
-                    ith = key.ith;                    
-#ifdef JOB_DEBUG
-                {
-                    std::lock_guard<std::mutex> lock(count_mutex);
-                    memory_count++;
-                }
-#endif
-                }  
-                if(!gate_proj_ptr){
-                    #ifdef USE_NUMA
-                    gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-                    #else
-                    gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
-                    #endif
-                }
-                if(!up_proj_ptr){
-                    #ifdef USE_NUMA
-                    up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-                    #else
-                    up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
-                    #endif
-                }
-                float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
-                llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+//                 void* gate_proj_ptr = nullptr;
+//                 void* up_proj_ptr   = nullptr;
+//                 auto ready_pair = streamer_->poll_if_all_ready_for_thread(thread_id, layout_helper_);  
+//                 if (ready_pair) {  
+//                     // 数据已就绪，标记为消费完成  
+//                     auto p = ready_pair->ptrs;
+//                     auto key = ready_pair->key;
+//                     gate_proj_ptr = p[ProjType::GATE];
+//                     up_proj_ptr = p[ProjType::UP];
+//                     expert_id = key.expert;
+//                     expert_idx = key.expert_idx;
+//                     ith = key.ith;
+//                     streamer_->mark_consumed_all_for_thread(thread_id);  
+// #ifdef JOB_DEBUG
+//                 {
+//                     std::lock_guard<std::mutex> lock(count_mutex);
+//                     assert(up_proj_ptr != nullptr && gate_proj_ptr!=nullptr);
+//                     ready_count++;
+//                 }
+// #endif
+//                 } else {  
+//                     // 数据未就绪，取消所有该线程的 inflight I/O  
+//                     auto key = streamer_->cancel_inflight_for_thread(thread_id);  
+//                     expert_id = key.expert;
+//                     expert_idx = key.expert_idx;
+//                     ith = key.ith;                    
+// #ifdef JOB_DEBUG
+//                 {
+//                     std::lock_guard<std::mutex> lock(count_mutex);
+//                     memory_count++;
+//                 }
+// #endif
+//                 }  
+//                 if(!gate_proj_ptr){
+//                     #ifdef USE_NUMA
+//                     gate_proj_ptr = (uint8_t*)gate_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+//                     #else
+//                     gate_proj_ptr = (uint8_t*)gate_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type);
+//                     #endif
+//                 }
+//                 if(!up_proj_ptr){
+//                     #ifdef USE_NUMA
+//                     up_proj_ptr = (uint8_t*)up_proj_numa_[Backend::numa_node] + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+//                     #else
+//                     up_proj_ptr = (uint8_t*)up_proj_ + (expert_id * config_.intermediate_size + ith * config_.stride) * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type);
+//                     #endif
+//                 }
+//                 float* gate_output_ptr = s_gate_output_[expert_idx] + ith * config_.stride;
+//                 llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_proj_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_input_ptr, config_.hidden_size / ggml_blck_size(config_.gate_type), gate_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.gate_type, ggml_internal_get_type_traits(config_.gate_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
 
-                float* up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
-                llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, ggml_internal_get_type_traits(config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
-                if(config_.use_silu){
-                    // use silu as act fn
-                    for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
-                        s_intermediate_fp32_[expert_idx][i] = act_fn(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
-                    }
-                } else {
-                    // use relu as act fn
-                    for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
-                        s_intermediate_fp32_[expert_idx][i] = act_fn_relu(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
-                    }
-                }
-                if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) == 0) {
-                    float* intermediate_fp32_ptr = s_intermediate_fp32_[expert_idx] + ith * config_.stride;
-                    void* down_input_ptr = s_down_input_[expert_idx] + ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
-                    from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
-                }
-            }  
-        }, nullptr);  
-    }
+//                 float* up_output_ptr = s_up_output_[expert_idx] + ith * config_.stride;
+//                 llamafile_sgemm(config_.stride, 1, config_.hidden_size / ggml_blck_size(config_.up_type), up_proj_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_input_ptr, config_.hidden_size / ggml_blck_size(config_.up_type), up_output_ptr, config_.stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, ggml_internal_get_type_traits(config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+//                 if(config_.use_silu){
+//                     // use silu as act fn
+//                     for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
+//                         s_intermediate_fp32_[expert_idx][i] = act_fn(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
+//                     }
+//                 } else {
+//                     // use relu as act fn
+//                     for (int i = ith * config_.stride; i < (ith + 1) * config_.stride; i++) {
+//                         s_intermediate_fp32_[expert_idx][i] = act_fn_relu(s_gate_output_[expert_idx][i]) * s_up_output_[expert_idx][i];
+//                     }
+//                 }
+//                 if (config_.stride % ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) == 0) {
+//                     float* intermediate_fp32_ptr = s_intermediate_fp32_[expert_idx] + ith * config_.stride;
+//                     void* down_input_ptr = s_down_input_[expert_idx] + ith * config_.stride * ggml_type_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type) / ggml_blck_size(ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+//                     from_float(intermediate_fp32_ptr, down_input_ptr, config_.stride, ggml_internal_get_type_traits(config_.down_type).vec_dot_type);
+//                 }
+//             }  
+//         }, nullptr);  
+//     }
 #ifdef TIME_PERF
     int gate_count = nth * k;
     double gate_avg = gate_count > 0 ? static_cast<double>(gate_total) / gate_count : 0.0;
@@ -441,6 +469,7 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     std::cout << " first_count: " << first_count <<  std::endl;
     std::cout << " ready_count: " << ready_count <<  std::endl;
     std::cout << " memory_count: " << memory_count <<  std::endl;
+    std::cout << " timeout_count: " << timeout_count <<  std::endl;
     if(memory_count + ready_count != gate_count)
         throw std::runtime_error("miss task found!"); 
 #endif

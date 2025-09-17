@@ -50,6 +50,7 @@ class Backend {
     static thread_local int thread_local_id;
     static ThreadType get_thread_type() { return thread_type_; }
     void bind_thread_to_resctrl(int thread_id, ThreadType type);  
+    int get_iothread_num();
 
   private:
     static thread_local ThreadType thread_type_;  

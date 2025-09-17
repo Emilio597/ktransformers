@@ -168,6 +168,7 @@ public:
         for (auto &ctx_ptr : ctxs_) {
             if (ctx_ptr->ring_inited) io_uring_queue_exit(&ctx_ptr->ring);
         }
+        cleanup_shared_resources();
     }
 
     int thread_index() const{  
@@ -265,6 +266,12 @@ public:
             return result;
         }
         return std::nullopt;
+    }
+    
+    SliceKey cancel_inflight()
+    {
+        int tid = thread_index();
+        return cancel_inflight_for_thread(tid);
     }
 
     SliceKey cancel_inflight_for_thread(int tid) {  
@@ -565,6 +572,7 @@ class MOE {
 
     SSDStreamConfig ssd_cfg_;
     LayoutHelper layout_helper_;
+    // std::atomic<int> remaining_tasks{0};
     // std::unique_ptr<SliceStreamer> streamer_;
     // SliceShape slice_shape_;
     // int worker_threads_ = std::max(1u, std::thread::hardware_concurrency());

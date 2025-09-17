@@ -69,16 +69,18 @@ void Backend::bind_thread_to_resctrl(int thread_id, ThreadType type) {
         tasks_file << syscall(SYS_gettid) << std::endl;  
         tasks_file.close();  
         thread_type_ = type;  
-        printf("Thread %d bound to %s group\\n", thread_id,   
+        printf("Thread %d bound to %s group\n", thread_id,   
                (type == ThreadType::IO_THREAD) ? "IO" : "MEMORY");  
     } else {  
-        fprintf(stderr, "Failed to bind thread %d to resctrl group %s\\n",   
+        fprintf(stderr, "Failed to bind thread %d to resctrl group %s\n",   
                 thread_id, cgroup_path);  
         std::exit(EXIT_FAILURE);
     }  
 }  
 
 int Backend::get_thread_num() { return max_thread_num_; }
+
+int Backend::get_iothread_num() { return io_threads_count_; }
 
 void Backend::do_work_stealing_job(int task_num,
                                    std::function<void(int)> init_func,

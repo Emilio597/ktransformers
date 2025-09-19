@@ -140,7 +140,7 @@ public:
         std::vector<std::unique_ptr<Buffer>> bufs;  // N 个缓冲（1 或 2）
         io_uring ring{};            // 每线程 1 个队列
         bool ring_inited = false;
-        std::vector<size_t> in_flight;
+        // std::vector<size_t> in_flight;
         // std::unordered_map<std::string,int> fd_cache; // 路径 -> fd
         std::mutex mtx;
     };
@@ -153,7 +153,7 @@ public:
             ctxs_[t] = std::make_unique<ThreadCtx>();
             auto &ctx = *ctxs_[t];
             ctx.bufs.resize(per_thread_);
-            ctx.in_flight.resize(per_thread_, 0);
+            // ctx.in_flight.resize(per_thread_, 0);
             for (auto &b : ctx.bufs) {
                 b = std::make_unique<Buffer>();
                 void* ptr = ::operator new(max_slice_, std::align_val_t(4096));
@@ -186,35 +186,34 @@ public:
     }
     bool has_inflight_for_thread(int tid) const {  
         auto &ctx = *ctxs_[tid];  
-        bool has = false;
-        for (auto li : ctx.in_flight) {
-            if (li != 0) { has = true; break; }
+        for (const auto &b : ctx.bufs) {
+            if (b->in_use.load(std::memory_order_acquire)) return true;
         }
-        return has;
+        return false;
     }
 
     int inflight_size() const{
         int tid = thread_index(); 
         auto &ctx = *ctxs_[tid];  
-        int has = 0;
-        for (auto li : ctx.in_flight) {
-            if (li != 0) has++; 
+        int cnt = 0;
+        for (const auto &b : ctx.bufs) {
+            if (b->in_use.load(std::memory_order_acquire)) ++cnt;
         }
-        return has;
+        return cnt;
     }
 
 
-    std::optional<ReadyTaskPointers> poll_if_all_ready(const LayoutHelper& lh_) {
+    std::optional<ReadyTaskPointers> poll_if_all_ready() {
         int tid = thread_index();
-        return poll_if_all_ready_for_thread(tid, lh_);
+        return poll_if_all_ready_for_thread(tid);
     }
 
-    std::optional<ReadyTaskPointers> poll_if_all_ready_for_thread(int tid, const LayoutHelper& lh_) {
+    std::optional<ReadyTaskPointers> poll_if_all_ready_for_thread(int tid) {
         auto &ctx = *ctxs_[tid];
 
         int total_req = 0;
-        for (auto li : ctx.in_flight) {
-            if (li != 0) total_req++;
+        for (const auto &b : ctx.bufs) {
+            if (b->in_use.load(std::memory_order_acquire)) ++total_req;
         }
         if (total_req == 0) return std::nullopt;
 
@@ -233,13 +232,6 @@ public:
                         // IO失败，释放buffer并从inflight移除
                         b->in_use.store(false, std::memory_order_release);
                         b->ready.store(false, std::memory_order_release);
-                        size_t li = lh_.inflight_index(b->key);
-                        for (auto &slot : ctx.in_flight) {
-                            if (slot == li) {
-                                slot = 0; // 清除占用
-                                break;
-                            }
-                        }
                     }
                 }
                 // 消费(acknowledges)这个完成事件
@@ -260,6 +252,7 @@ public:
                 if (b->in_use.load(std::memory_order_acquire)) {
                     result.ptrs[b->key.type] = b->data.get();
                     result.key = b->key;
+                    // 标记为已取走就绪标志（消费动作由 mark_consumed_all 或者 poll_ready 负责真正释放 in_use）
                     b->ready.store(false, std::memory_order_relaxed);
                 }
             }
@@ -276,25 +269,24 @@ public:
 
     SliceKey cancel_inflight_for_thread(int tid) {  
         SliceKey cancelled_key;  
-        if (tid >= ctxs_.size()) 
-            throw std::runtime_error("cancel_inflight error thread id:"+ std::to_string(tid));  
+        // if (tid >= ctxs_.size()) 
+        //     throw std::runtime_error("cancel_inflight error thread id:"+ std::to_string(tid));  
         auto &ctx = *ctxs_[tid];  
         
         cancelled_key = ctx.bufs[0]->key;
         
         if (ctx.ring_inited) {  
             // 使用 io_uring_prep_cancel 取消特定的 I/O 操作  
-            for (int buf_idx = 0; buf_idx < (int)ctx.bufs.size(); ++buf_idx) {  
-                if (ctx.in_flight[buf_idx] != 0) { // 有在途请求  
-                    auto &buffer = ctx.bufs[buf_idx];  
-
+            for (auto &buffer : ctx.bufs) {
+                if (buffer->in_use.load(std::memory_order_acquire)) {
                     io_uring_sqe* cancel_sqe = io_uring_get_sqe(&ctx.ring);  
                     if (cancel_sqe) {  
+                        // 以 buffer 指针作为 target 取消对应提交
                         io_uring_prep_cancel(cancel_sqe, buffer.get(), 0);  
                         io_uring_sqe_set_data(cancel_sqe, nullptr);  
-                    }  
-                }  
-            }  
+                    }
+                }
+            }
             
             // 提交取消请求  
             io_uring_submit(&ctx.ring);  
@@ -314,9 +306,6 @@ public:
             b->ready.store(false, std::memory_order_release);  
         }  
         
-        // 清空该线程的 inflight 映射  
-        std::fill(ctx.in_flight.begin(), ctx.in_flight.end(), 0); 
-        
         return cancelled_key;  
     }
 
@@ -329,8 +318,8 @@ public:
             if (b->in_use.load(std::memory_order_acquire)) {
                 b->in_use.store(false, std::memory_order_release);
             }
+            b->ready.store(false, std::memory_order_release);
         }
-        std::fill(ctx.in_flight.begin(), ctx.in_flight.end(), 0);
     }
 
     void mark_consumed_all_for_thread(int tid) {
@@ -340,8 +329,8 @@ public:
             if (b->in_use.load(std::memory_order_acquire)) {
                 b->in_use.store(false, std::memory_order_release);
             }
+            b->ready.store(false, std::memory_order_release);
         }
-        std::fill(ctx.in_flight.begin(), ctx.in_flight.end(), 0);
     }
 
     // 查询是否有已就绪的切片；若有，返回 (buffer 指针, key)
@@ -377,10 +366,10 @@ public:
     bool ensure_inflight(const SliceKey& key,const LayoutHelper& lh_){
         int tid = thread_index();
         auto &ctx = *ctxs_[tid];
-        size_t li = lh_.inflight_index(key);
-        for (size_t infl : ctx.in_flight) {
-            if (infl == li) return true; // 已在途
-        }
+        // size_t li = lh_.inflight_index(key);
+        // for (size_t infl : ctx.in_flight) {
+        //     if (infl == li) return true; // 已在途
+        // }
         // 找空闲 buffer
         for (int i = 0; i < per_thread_; ++i) {
             auto &b = ctx.bufs[i];
@@ -399,7 +388,7 @@ public:
                     io_uring_sqe_set_data(sqe, b.get());
                     io_uring_submit(&ctx.ring);
                 }
-                ctx.in_flight[i] = li;
+                // ctx.in_flight[i] = li;
                 return true;
             }
         }

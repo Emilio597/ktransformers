@@ -1,0 +1,1 @@
+python ktransformers/server/main.py --architectures Qwen3MoeForCausalLM --model_path /home/emilio/mnt/qwen3 --gguf_path /home/emilio/mnt/qwen3/Q4_K_M --optimize_config_path ktransformers/optimize/optimize_rules/Qwen3Moe-serve.yaml --slice_output_dir /home/emilio/ssd/slice/ --cpu_infer 85 --backend_type balance_serve

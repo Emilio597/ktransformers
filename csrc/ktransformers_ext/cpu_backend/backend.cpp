@@ -28,6 +28,7 @@ thread_local ThreadType Backend::thread_type_ = ThreadType::MEMORY_THREAD;
 Backend::Backend(int max_thread_num) {
     max_thread_num_ = max_thread_num;
     io_threads_count_ = max_thread_num / 2;
+    // max_thread_num_ = io_threads_count_ * 3;
 
     thread_state_.resize(max_thread_num_);
     for (int i = 0; i < max_thread_num_; i++) {
